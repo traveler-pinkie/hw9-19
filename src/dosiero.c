@@ -118,7 +118,7 @@ static char *canonical_path(FILE *disk, idisk_t *inodes, uint32_t inode_count,
                             uint32_t inode_start_sector, uint32_t data_start, uint32_t data_end) {
     if (target_inode < 1 || target_inode > inode_count) return NULL;
     if (target_inode == 1) {
-        char *r = malloc(2); if (!r) return NULL; strcpy(r, "/"); return r;
+        char *r = malloc(3); if (!r) return NULL; strcpy(r, "/"); strcat(r, "/"); return r; // return "/"
     }
     // store components in reverse
     char **components = malloc((inode_count+2) * sizeof(char*));
@@ -231,9 +231,10 @@ static char *canonical_path(FILE *disk, idisk_t *inodes, uint32_t inode_count,
         cur = parent;
     }
 
-    // assemble path
+    // assemble path; allocate enough space for trailing '/'
     size_t total = 1; // leading '/'
     for (int i = compc-1; i >= 0; i--) total += strlen(components[i]) + 1;
+    total += 1; // extra for trailing '/'
     char *out = malloc(total + 1);
     if (!out) {
         for (int i = 0; i < compc; i++) free(components[i]);
@@ -244,16 +245,21 @@ static char *canonical_path(FILE *disk, idisk_t *inodes, uint32_t inode_count,
         if (strlen(out) > 1) strcat(out, "/");
         strcat(out, components[i]);
     }
+    // ensure trailing '/'
+    size_t len = strlen(out);
+    if (len == 0 || out[len-1] != '/') {
+        strcat(out, "/");
+    }
     // cleanup
     for (int i = 0; i < compc; i++) free(components[i]);
     free(components);
     return out;
 }
 
-/* List directory entries (prints to stdout). Prints "./" and "../" first like expected output,
-   then other entries in directory order. Appends '/' to directory names. */
-static void list_directory(FILE *disk, idisk_t *inodes, uint32_t inode_count,
-                           uint32_t dirino,
+/* Recursive listing of directory hierarchy.
+   prefix is printed before entries ("" for top-level). */
+static void list_hierarchy(FILE *disk, idisk_t *inodes, uint32_t inode_count,
+                           uint32_t dirino, const char *prefix,
                            uint32_t inode_start_sector, uint32_t data_start, uint32_t data_end) {
     if (dirino < 1 || dirino > inode_count) return;
     idisk_t *din = &inodes[dirino];
@@ -262,9 +268,12 @@ static void list_directory(FILE *disk, idisk_t *inodes, uint32_t inode_count,
     if ((din->i_mode & IFMT) != IFDIR) return;
 
     unsigned char secbuf[512];
-    // print "../" and "./" first (even if they are not present on-disk tests expect them)
-    printf("../\n");
-    printf("./\n");
+    // top-level prints "../" and "./" with no prefix
+    bool top = (prefix == NULL) || (prefix[0] == '\0');
+    if (top) {
+        printf("../\n");
+        printf("./\n");
+    }
 
     bool is_large = (din->i_mode & 010000) != 0;
     if (!is_large) {
@@ -279,10 +288,25 @@ static void list_directory(FILE *disk, idisk_t *inodes, uint32_t inode_count,
                 if (ent_ino == 0) continue;
                 char nm[15]; memset(nm,0,sizeof(nm)); memcpy(nm, &ent[2], 14);
                 if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
-                // print name and / if directory
+                // build display name
+                char disp[4096];
+                if (top) snprintf(disp, sizeof(disp), "%s", nm);
+                else snprintf(disp, sizeof(disp), "%s%s", prefix, nm);
+
                 bool isdir = ((inodes[ent_ino].i_mode & IFMT) == IFDIR);
-                if (isdir) printf("%s/\n", nm);
-                else printf("%s\n", nm);
+                if (isdir) {
+                    printf("%s/\n", disp);
+                    // print disp/../ and disp/./ lines
+                    printf("%s/../\n", disp);
+                    printf("%s/./\n", disp);
+                    // recurse with new prefix
+                    char newpref[4096];
+                    if (top) snprintf(newpref, sizeof(newpref), "%s/", nm);
+                    else snprintf(newpref, sizeof(newpref), "%s%s/", prefix, nm);
+                    list_hierarchy(disk, inodes, inode_count, ent_ino, newpref, inode_start_sector, data_start, data_end);
+                } else {
+                    printf("%s\n", disp);
+                }
             }
         }
     } else {
@@ -303,9 +327,22 @@ static void list_directory(FILE *disk, idisk_t *inodes, uint32_t inode_count,
                     if (ent_ino == 0) continue;
                     char nm[15]; memset(nm,0,sizeof(nm)); memcpy(nm, &ent[2], 14);
                     if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0) continue;
+                    char disp[4096];
+                    if (top) snprintf(disp, sizeof(disp), "%s", nm);
+                    else snprintf(disp, sizeof(disp), "%s%s", prefix, nm);
+
                     bool isdir = ((inodes[ent_ino].i_mode & IFMT) == IFDIR);
-                    if (isdir) printf("%s/\n", nm);
-                    else printf("%s\n", nm);
+                    if (isdir) {
+                        printf("%s/\n", disp);
+                        printf("%s/../\n", disp);
+                        printf("%s/./\n", disp);
+                        char newpref[4096];
+                        if (top) snprintf(newpref, sizeof(newpref), "%s/", nm);
+                        else snprintf(newpref, sizeof(newpref), "%s%s/", prefix, nm);
+                        list_hierarchy(disk, inodes, inode_count, ent_ino, newpref, inode_start_sector, data_start, data_end);
+                    } else {
+                        printf("%s\n", disp);
+                    }
                 }
             }
         }
@@ -613,21 +650,12 @@ int dosiero_main(int argc, char **argv) {
     }
 
     if (l_seen && n_seen) {
-        // nonopt_arg may be a pathname or inode depending on -n/-i; tests used -n with absolute pathname
         if (nonopt_count != 1 || !nonopt_arg) { fclose(disk); free(inodes); return EXIT_FAILURE; }
-        // nonopt_arg is a pathname when -n
-        uint32_t dirino = 0;
-        if (n_seen) {
-            dirino = resolve_pathname(disk, inodes, inode_count, nonopt_arg,
+        uint32_t dirino = resolve_pathname(disk, inodes, inode_count, nonopt_arg,
                                       inode_start_sector, data_start, data_end);
-            if (dirino == 0) { fclose(disk); free(inodes); return EXIT_FAILURE; }
-        } else {
-            char *endptr = NULL;
-            long inum = strtol(nonopt_arg, &endptr, 10);
-            if (*nonopt_arg == '\0' || *endptr != '\0' || inum <= 0) { fclose(disk); free(inodes); return EXIT_FAILURE; }
-            dirino = (uint32_t)inum;
-        }
-        list_directory(disk, inodes, inode_count, dirino, inode_start_sector, data_start, data_end);
+        if (dirino == 0) { fclose(disk); free(inodes); return EXIT_FAILURE; }
+        // call recursive listing with empty prefix for top-level
+        list_hierarchy(disk, inodes, inode_count, dirino, "", inode_start_sector, data_start, data_end);
         fclose(disk); free(inodes); return EXIT_SUCCESS;
     }
 
